@@ -1,9 +1,11 @@
 [package]
 name = "podman-healthcheckd"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 authors = ["Franz Geffke <mail@gofranz.com>"]
+description = "Podman healthcheck scheduler for systems without systemd"
+repository = "https://github.com/franzos/podman-healthcheckd"
 
 [[bin]]
 name = "podman-healthcheckd"
