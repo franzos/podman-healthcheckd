@@ -1,6 +1,6 @@
 [package]
 name = "podman-healthcheckd"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "MIT"
 authors = ["Franz Geffke <mail@gofranz.com>"]
@@ -10,6 +10,18 @@ repository = "https://github.com/franzos/podman-healthcheckd"
 [[bin]]
 name = "podman-healthcheckd"
 path = "src/main.rs"
+
+[package.metadata.deb]
+maintainer = "Franz Geffke <mail@gofranz.com>"
+section = "utils"
+assets = [
+    ["target/release/podman-healthcheckd", "usr/bin/", "755"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/podman-healthcheckd", dest = "/usr/bin/podman-healthcheckd", mode = "755" },
+]
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "signal", "sync", "io-util"] }

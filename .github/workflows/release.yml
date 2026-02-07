@@ -1,0 +1,98 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Build
+        run: cargo build --release --target x86_64-unknown-linux-gnu
+
+      - name: Package
+        run: |
+          cd target/x86_64-unknown-linux-gnu/release
+          tar czf ../../../podman-healthcheckd-x86_64-unknown-linux-gnu.tar.gz podman-healthcheckd
+          cd ../../..
+          shasum -a 256 podman-healthcheckd-x86_64-unknown-linux-gnu.tar.gz > podman-healthcheckd-x86_64-unknown-linux-gnu.tar.gz.sha256
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: podman-healthcheckd-x86_64-unknown-linux-gnu
+          path: |
+            podman-healthcheckd-x86_64-unknown-linux-gnu.tar.gz
+            podman-healthcheckd-x86_64-unknown-linux-gnu.tar.gz.sha256
+
+  deb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb
+
+      - name: Build deb package
+        run: cargo deb
+
+      - name: Upload deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: podman-healthcheckd-deb
+          path: target/debian/*.deb
+
+  rpm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-generate-rpm
+        run: cargo install cargo-generate-rpm
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Build rpm package
+        run: cargo generate-rpm
+
+      - name: Upload rpm artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: podman-healthcheckd-rpm
+          path: target/generate-rpm/*.rpm
+
+  release:
+    needs: [build, deb, rpm]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          draft: false
+          files: |
+            podman-healthcheckd-*.tar.gz
+            podman-healthcheckd-*.tar.gz.sha256
+            *.deb
+            *.rpm

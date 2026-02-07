@@ -35,6 +35,18 @@ RUST_LOG=info ./target/release/podman-healthcheckd
 
 Log levels: `error`, `warn`, `info`, `debug`, `trace` (via `RUST_LOG`).
 
+## Install
+
+### From crates.io
+
+```bash
+cargo install podman-healthcheckd
+```
+
+### From GitHub releases
+
+Pre-built binaries and packages (`.deb`, `.rpm`) are available on the [Releases](https://github.com/franzos/podman-healthcheckd/releases) page.
+
 ## License
 
 MIT
