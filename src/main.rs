@@ -195,7 +195,7 @@ impl TaskManager {
         };
         info!("[{name}] scheduling healthcheck (interval={:.1?}, start_period={:.1?}, retries={})",
             ns_to_duration(config.interval),
-            ns_to_duration(config.start_period),
+            Duration::from_nanos(config.start_period),
             config.retries,
         );
         let cid = id.clone();
