@@ -140,7 +140,7 @@ async fn healthcheck_loop(
     config: HealthcheckConfig,
     token: CancellationToken,
 ) {
-    let start_period = ns_to_duration(config.start_period);
+    let start_period = Duration::from_nanos(config.start_period); // 0 means no wait (docker/podman default)
     let interval = ns_to_duration(config.interval);
 
     if !start_period.is_zero() {
@@ -154,10 +154,6 @@ async fn healthcheck_loop(
     info!("[{name}] healthcheck active, interval {interval:.1?}");
     loop {
         tokio::select! {
-            _ = tokio::time::sleep(interval) => {}
-            _ = token.cancelled() => return,
-        }
-        tokio::select! {
             ok = run_healthcheck(&id) => {
                 if ok {
                     info!("[{name}] healthcheck passed");
@@ -165,6 +161,10 @@ async fn healthcheck_loop(
                     warn!("[{name}] healthcheck failed");
                 }
             }
+            _ = token.cancelled() => return,
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
             _ = token.cancelled() => return,
         }
     }
