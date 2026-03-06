@@ -1,5 +1,3 @@
-# podman-healthcheckd
-
 <p align="center">
   <img src="assets/logo.svg" alt="podman-healthcheckd" width="480">
 </p>
