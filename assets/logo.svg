@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 140">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#3b2e7e"/>
+      <stop offset="100%" stop-color="#5c4baf"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Container box -->
+  <rect x="16" y="24" width="92" height="92" rx="14" fill="url(#bg)" />
+
+  <!-- Heartbeat pulse line -->
+  <polyline
+    points="28,70 44,70 50,50 58,90 66,40 74,85 80,60 88,70 96,70"
+    fill="none" stroke="#e8e0ff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round" />
+
+  <!-- Small container grid dots (Podman nod) -->
+  <circle cx="34" cy="38" r="3" fill="#e8e0ff" opacity="0.4"/>
+  <circle cx="48" cy="38" r="3" fill="#e8e0ff" opacity="0.4"/>
+  <circle cx="62" cy="38" r="3" fill="#e8e0ff" opacity="0.4"/>
+
+  <!-- Text -->
+  <text x="124" y="62" font-family="system-ui, -apple-system, sans-serif" font-size="32" font-weight="700" fill="#2d2250">podman-healthcheckd</text>
+  <text x="124" y="90" font-family="system-ui, -apple-system, sans-serif" font-size="15" fill="#6b5f8a">container healthchecks without systemd</text>
+</svg>

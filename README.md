@@ -1,6 +1,11 @@
 # podman-healthcheckd
 
-A lightweight Rust daemon that schedules Podman healthchecks without relying on systemd timers. Works on any Linux distribution.
+<p align="center">
+  <img src="assets/logo.svg" alt="podman-healthcheckd" width="480">
+</p>
+<p align="center">
+  A lightweight Rust daemon that schedules Podman healthchecks without relying on systemd timers. Works on any Linux distribution.
+</p>
 
 ## Why
 
@@ -14,6 +19,21 @@ Podman normally depends on systemd timers to run container healthchecks. On syst
 4. On SIGINT/SIGTERM, cancels all timers and exits cleanly
 
 The daemon only acts as a clock — `podman healthcheck run` handles retries, failing streaks, and on-failure actions internally.
+
+## Install
+
+| Method | Command |
+|--------|---------|
+| Cargo | `cargo install podman-healthcheckd` |
+| Debian/Ubuntu | Download [`.deb`](https://github.com/franzos/podman-healthcheckd/releases) — `sudo dpkg -i podman-healthcheckd_*_amd64.deb` |
+| Fedora/RHEL | Download [`.rpm`](https://github.com/franzos/podman-healthcheckd/releases) — `sudo rpm -i podman-healthcheckd-*.x86_64.rpm` |
+| Guix | `guix install -L <panther> podman-healthcheckd` ([Panther channel](https://github.com/franzos/panther)) |
+
+Pre-built binaries for Linux (x86_64) on [GitHub Releases](https://github.com/franzos/podman-healthcheckd/releases).
+
+### Guix service
+
+A Guix service definition is available in the [Panther channel](https://github.com/franzos/panther) for running podman-healthcheckd as a managed system service.
 
 ## Build
 
@@ -34,18 +54,6 @@ RUST_LOG=info ./target/release/podman-healthcheckd
 ```
 
 Log levels: `error`, `warn`, `info`, `debug`, `trace` (via `RUST_LOG`).
-
-## Install
-
-### From crates.io
-
-```bash
-cargo install podman-healthcheckd
-```
-
-### From GitHub releases
-
-Pre-built binaries and packages (`.deb`, `.rpm`) are available on the [Releases](https://github.com/franzos/podman-healthcheckd/releases) page.
 
 ## License
 
