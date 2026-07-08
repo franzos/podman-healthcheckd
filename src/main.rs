@@ -64,6 +64,7 @@ struct PodmanEvent {
 async fn podman_ps() -> Result<Vec<PsEntry>, String> {
     let output = Command::new("podman")
         .args(["ps", "--format", "json"])
+        .kill_on_drop(true)
         .output()
         .await
         .map_err(|e| format!("failed to run podman ps: {e}"))?;
@@ -87,6 +88,7 @@ async fn podman_ps() -> Result<Vec<PsEntry>, String> {
 async fn get_healthcheck(id: &str) -> Option<HealthcheckConfig> {
     let output = Command::new("podman")
         .args(["inspect", id])
+        .kill_on_drop(true)
         .output()
         .await
         .ok()?;
@@ -110,6 +112,7 @@ async fn get_healthcheck(id: &str) -> Option<HealthcheckConfig> {
 async fn run_healthcheck(id: &str) -> bool {
     let output = match Command::new("podman")
         .args(["healthcheck", "run", id])
+        .kill_on_drop(true)
         .output()
         .await
     {
@@ -270,6 +273,7 @@ async fn watch_events_inner(
             "--filter",
             "type=container",
         ])
+        .kill_on_drop(true)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()?;
