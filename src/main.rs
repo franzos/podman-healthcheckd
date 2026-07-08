@@ -418,7 +418,7 @@ async fn main() {
     let mut manager = TaskManager::new(token.clone());
 
     // Start event watcher first so events are buffered during enumeration
-    let (tx, mut rx) = mpsc::channel::<Action>(64);
+    let (tx, mut rx) = mpsc::channel::<Action>(1024);//or unbounded_channel
     let watcher = tokio::spawn(watch_events(tx, token.clone()));
 
     enumerate_existing(&mut manager).await;
