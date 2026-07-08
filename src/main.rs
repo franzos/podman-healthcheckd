@@ -109,20 +109,16 @@ async fn get_healthcheck(id: &str) -> Option<HealthcheckConfig> {
     Some(hc)
 }
 
-async fn run_healthcheck(id: &str) -> bool {
-    let output = match Command::new("podman")
+async fn run_healthcheck(id: &str, timeout: Duration) -> bool {
+    let fut = Command::new("podman")
         .args(["healthcheck", "run", id])
         .kill_on_drop(true)
-        .output()
-        .await
-    {
-        Ok(o) => o,
-        Err(e) => {
-            warn!("failed to exec podman healthcheck run {id}: {e}");
-            return false;
-        }
-    };
-    output.status.success()
+        .output();
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(Ok(o)) => o.status.success(),
+        Ok(Err(e)) => { warn!("[{id}] exec error: {e}"); false }
+        Err(_) => { warn!("[{id}] healthcheck timed out after {timeout:.1?}"); false }
+    }
 }
 
 // --- Nanosecond helpers ---
@@ -133,6 +129,28 @@ fn ns_to_duration(ns: u64) -> Duration {
     } else {
         Duration::from_nanos(ns)
     }
+}
+async fn restart_container(id: &str) -> bool {
+    let output = match Command::new("podman")
+        .args(["restart", id])
+        .kill_on_drop(true)
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            error!("failed to exec podman restart {id}: {e}");
+            return false;
+        }
+    };
+    if !output.status.success() {
+        error!(
+            "podman restart {id} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        return false;
+    }
+    true
 }
 
 // --- Per-container healthcheck loop ---
@@ -153,15 +171,38 @@ async fn healthcheck_loop(
             _ = token.cancelled() => return,
         }
     }
-
+    let timeout = ns_to_duration(config.timeout);
     info!("[{name}] healthcheck active, interval {interval:.1?}");
+    let mut consecutive_failures: u32 = 0;
+    let mut restart_triggered = false;
     loop {
         tokio::select! {
-            ok = run_healthcheck(&id) => {
+            ok = run_healthcheck(&id,timeout) => {
                 if ok {
-                    info!("[{name}] healthcheck passed");
+		            if consecutive_failures >= config.retries.max(1) {
+                        info!("[{name}] healthcheck recovered, now healthy");
+                    }
+                    consecutive_failures = 0;
+                    restart_triggered = false;
+	                info!("[{name}] healthcheck passed");	
                 } else {
-                    warn!("[{name}] healthcheck failed");
+			        consecutive_failures += 1;
+                    if consecutive_failures >= config.retries.max(1) {
+                            error!("[{name}] healthcheck failed {consecutive_failures} times, container unhealthy");
+                        if !restart_triggered {
+                            restart_triggered = true;
+                            warn!("[{name}] restarting unhealthy container");
+                            if restart_container(&id).await {
+                                info!("[{name}] restart succeeded, resetting failure count");
+                                consecutive_failures = 0;
+                                } else {
+                                error!("[{name}] restart failed, will retry restart on next unhealthy threshold hit");
+                                restart_triggered = false;
+                                }		
+                        }	
+	    		    } else {
+		        	    warn!("[{name}] healthcheck failed ({consecutive_failures}/{})", config.retries);
+    			    }
                 }
             }
             _ = token.cancelled() => return,
