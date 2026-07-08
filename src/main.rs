@@ -1,3 +1,5 @@
+use std::fs::OpenOptions;
+use std::os::unix::io::AsRawFd;
 use log::{error, info, warn};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -7,6 +9,33 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use std::io::Write;
+
+fn lock_path() -> String {
+    std::env::var("XDG_RUNTIME_DIR")
+        .map(|d| format!("{d}/podman-healthcheckd.lock"))
+        .unwrap_or_else(|_| "/tmp/podman-healthcheckd.lock".to_string())
+}
+
+/// Acquires an exclusive, non-blocking advisory lock to ensure only one
+/// instance of the daemon runs at a time. The lock is held for the
+/// lifetime of the returned File and is automatically released by the
+/// kernel when the process exits or dies for any reason (including
+// crashes or SIGKILL), unlike a hand-written PID file.
+fn acquire_single_instance_lock() -> std::io::Result<std::fs::File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(lock_path())?;
+
+    let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    Ok(file)
+}
+
 
 // --- Serde types matching real Podman 5.x JSON ---
 
@@ -411,7 +440,17 @@ async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp_secs()
         .init();
-
+    let _lock = match acquire_single_instance_lock() {
+        Ok(f) => f,
+        Err(e) => {
+            error!("another instance of podman-healthcheckd is already running (or lock file inaccessible): {e}");
+            std::process::exit(1);
+        }
+    };
+    let mut f = &_lock;
+    if let Err(e) = write!(f, "{}", std::process::id()) {
+        warn!("failed to write PID to lock file: {e}");
+    }
     info!("podman-healthcheckd starting");
 
     let token = CancellationToken::new();
