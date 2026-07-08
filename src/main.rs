@@ -1,3 +1,5 @@
+use std::fs::OpenOptions;
+use std::os::unix::io::AsRawFd;
 use log::{error, info, warn};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -7,6 +9,76 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use std::io::Write;
+use serde::Serialize;
+use std::sync::Arc;
+use tokio::sync::Mutex as AsyncMutex;
+
+
+#[derive(Serialize, Clone)]
+struct ContainerStatus {
+    name: String,
+    healthy: bool,
+    consecutive_failures: u32,
+    last_check: String, // RFC3339 timestamp
+}
+
+type SharedStatus = Arc<AsyncMutex<HashMap<String, ContainerStatus>>>;
+
+fn status_path() -> String {
+    std::env::var("XDG_RUNTIME_DIR")
+        .map(|d| format!("{d}/podman-healthcheckd-status.json"))
+        .unwrap_or_else(|_| "/run/podman-healthcheckd-status.json".to_string())
+}
+
+async fn write_status_file(status: &SharedStatus) {
+    // Clone the data out while holding the lock only briefly,
+    // then serialize/write off the async runtime's thread.
+    let snapshot = {
+        let map = status.lock().await;
+        map.clone()
+    };
+
+    let result = tokio::task::spawn_blocking(move || {
+        let json = serde_json::to_string_pretty(&snapshot)?;
+        std::fs::write(status_path(), json)?;
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!("failed to write status file: {e}"),
+        Err(e) => warn!("status file write task panicked: {e}"),
+    }
+}
+
+fn lock_path() -> String {
+    std::env::var("XDG_RUNTIME_DIR")
+        .map(|d| format!("{d}/podman-healthcheckd.lock"))
+        .unwrap_or_else(|_| "/tmp/podman-healthcheckd.lock".to_string())
+}
+
+/// Acquires an exclusive, non-blocking advisory lock to ensure only one
+/// instance of the daemon runs at a time. The lock is held for the
+/// lifetime of the returned File and is automatically released by the
+/// kernel when the process exits or dies for any reason (including
+// crashes or SIGKILL), unlike a hand-written PID file.
+fn acquire_single_instance_lock() -> std::io::Result<std::fs::File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(lock_path())?;
+
+    let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    Ok(file)
+}
+
 
 // --- Serde types matching real Podman 5.x JSON ---
 
@@ -64,6 +136,7 @@ struct PodmanEvent {
 async fn podman_ps() -> Result<Vec<PsEntry>, String> {
     let output = Command::new("podman")
         .args(["ps", "--format", "json"])
+        .kill_on_drop(true)
         .output()
         .await
         .map_err(|e| format!("failed to run podman ps: {e}"))?;
@@ -87,6 +160,7 @@ async fn podman_ps() -> Result<Vec<PsEntry>, String> {
 async fn get_healthcheck(id: &str) -> Option<HealthcheckConfig> {
     let output = Command::new("podman")
         .args(["inspect", id])
+        .kill_on_drop(true)
         .output()
         .await
         .ok()?;
@@ -107,19 +181,16 @@ async fn get_healthcheck(id: &str) -> Option<HealthcheckConfig> {
     Some(hc)
 }
 
-async fn run_healthcheck(id: &str) -> bool {
-    let output = match Command::new("podman")
+async fn run_healthcheck(id: &str, timeout: Duration) -> bool {
+    let fut = Command::new("podman")
         .args(["healthcheck", "run", id])
-        .output()
-        .await
-    {
-        Ok(o) => o,
-        Err(e) => {
-            warn!("failed to exec podman healthcheck run {id}: {e}");
-            return false;
-        }
-    };
-    output.status.success()
+        .kill_on_drop(true)
+        .output();
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(Ok(o)) => o.status.success(),
+        Ok(Err(e)) => { warn!("[{id}] exec error: {e}"); false }
+        Err(_) => { warn!("[{id}] healthcheck timed out after {timeout:.1?}"); false }
+    }
 }
 
 // --- Nanosecond helpers ---
@@ -131,6 +202,28 @@ fn ns_to_duration(ns: u64) -> Duration {
         Duration::from_nanos(ns)
     }
 }
+async fn restart_container(id: &str) -> bool {
+    let output = match Command::new("podman")
+        .args(["restart", id])
+        .kill_on_drop(true)
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            error!("failed to exec podman restart {id}: {e}");
+            return false;
+        }
+    };
+    if !output.status.success() {
+        error!(
+            "podman restart {id} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        return false;
+    }
+    true
+}
 
 // --- Per-container healthcheck loop ---
 
@@ -139,6 +232,7 @@ async fn healthcheck_loop(
     name: String,
     config: HealthcheckConfig,
     token: CancellationToken,
+    status: SharedStatus,
 ) {
     let start_period = Duration::from_nanos(config.start_period); // 0 means no wait (docker/podman default)
     let interval = ns_to_duration(config.interval);
@@ -150,15 +244,57 @@ async fn healthcheck_loop(
             _ = token.cancelled() => return,
         }
     }
-
+    let timeout = ns_to_duration(config.timeout);
     info!("[{name}] healthcheck active, interval {interval:.1?}");
+    let mut consecutive_failures: u32 = 0;
+    let mut restart_triggered = false;
     loop {
         tokio::select! {
-            ok = run_healthcheck(&id) => {
+            ok = run_healthcheck(&id,timeout) => {
                 if ok {
-                    info!("[{name}] healthcheck passed");
+		            if consecutive_failures >= config.retries.max(1) {
+                        info!("[{name}] healthcheck recovered, now healthy");
+                    }
+                    consecutive_failures = 0;
+                    restart_triggered = false;
+	                info!("[{name}] healthcheck passed");	
                 } else {
-                    warn!("[{name}] healthcheck failed");
+			        consecutive_failures += 1;
+                    if consecutive_failures >= config.retries.max(1) {
+                            error!("[{name}] healthcheck failed {consecutive_failures} times, container unhealthy");
+                        if !restart_triggered {
+                            restart_triggered = true;
+                            warn!("[{name}] restarting unhealthy container");
+                            if restart_container(&id).await {
+                                info!("[{name}] restart succeeded, resetting failure count");
+                                consecutive_failures = 0;
+                                } else {
+                                error!("[{name}] restart failed, will retry restart on next unhealthy threshold hit");
+                                restart_triggered = false;
+                                }		
+                        }	
+	    		    } else {
+		        	    warn!("[{name}] healthcheck failed ({consecutive_failures}/{})", config.retries);
+    			    }
+                }
+                let healthy = consecutive_failures < config.retries.max(1);
+                let changed = {
+                    let mut map = status.lock().await;
+                    let changed = match map.get(&id) {
+                        Some(prev) => prev.healthy != healthy
+                            || prev.consecutive_failures != consecutive_failures,
+                        None => true, // first time we see this container
+                    };
+                    map.insert(id.clone(), ContainerStatus {
+                        name: name.clone(),
+                        healthy,
+                        consecutive_failures,
+                        last_check: chrono::Utc::now().to_rfc3339(),
+                    });
+                    changed
+                };
+                if changed {
+                    write_status_file(&status).await;
                 }
             }
             _ = token.cancelled() => return,
@@ -175,13 +311,15 @@ async fn healthcheck_loop(
 struct TaskManager {
     tasks: HashMap<String, (String, JoinHandle<()>)>,
     token: CancellationToken,
+    status: SharedStatus,
 }
 
 impl TaskManager {
-    fn new(token: CancellationToken) -> Self {
+    fn new(token: CancellationToken, status: SharedStatus) -> Self {
         Self {
             tasks: HashMap::new(),
             token,
+            status,
         }
     }
 
@@ -201,7 +339,7 @@ impl TaskManager {
         let cid = id.clone();
         let cname = name.clone();
         let ct = self.token.clone();
-        let handle = tokio::spawn(healthcheck_loop(cid, cname, config, ct));
+        let handle = tokio::spawn(healthcheck_loop(cid, cname, config, ct, self.status.clone()));
         self.tasks.insert(id, (name, handle));
     }
 
@@ -209,6 +347,15 @@ impl TaskManager {
         if let Some((name, handle)) = self.tasks.remove(id) {
             info!("[{name}] removing healthcheck timer");
             handle.abort();
+            let status = self.status.clone();
+            let id = id.to_string();
+            tokio::spawn(async move {
+                {
+                    let mut map = status.lock().await;
+                    map.remove(&id);
+                }
+                write_status_file(&status).await;
+            });
         }
     }
 
@@ -218,7 +365,13 @@ impl TaskManager {
             handle.abort();
         }
     }
-
+    async fn clear_status(&self) {
+        {
+            let mut map = self.status.lock().await;
+            map.clear();
+        }
+        write_status_file(&self.status).await;
+    }
     fn count(&self) -> usize {
         self.tasks.len()
     }
@@ -270,6 +423,7 @@ async fn watch_events_inner(
             "--filter",
             "type=container",
         ])
+        .kill_on_drop(true)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()?;
@@ -366,14 +520,26 @@ async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp_secs()
         .init();
-
+    let _lock = match acquire_single_instance_lock() {
+        Ok(f) => f,
+        Err(e) => {
+            error!("another instance of podman-healthcheckd is already running (or lock file inaccessible): {e}");
+            std::process::exit(1);
+        }
+    };
+    let mut f = &_lock;
+    if let Err(e) = write!(f, "{}", std::process::id()) {
+        warn!("failed to write PID to lock file: {e}");
+    }
     info!("podman-healthcheckd starting");
 
     let token = CancellationToken::new();
-    let mut manager = TaskManager::new(token.clone());
+    let status: SharedStatus = Arc::new(AsyncMutex::new(HashMap::new()));
+    let mut manager = TaskManager::new(token.clone(), status);
+    
 
     // Start event watcher first so events are buffered during enumeration
-    let (tx, mut rx) = mpsc::channel::<Action>(64);
+    let (tx, mut rx) = mpsc::channel::<Action>(1024);//or unbounded_channel
     let watcher = tokio::spawn(watch_events(tx, token.clone()));
 
     enumerate_existing(&mut manager).await;
@@ -407,6 +573,7 @@ async fn main() {
 
     token.cancel();
     manager.stop_all();
+    manager.clear_status().await;
     let _ = watcher.await;
     info!("podman-healthcheckd stopped");
 }
