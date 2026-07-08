@@ -10,6 +10,48 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use std::io::Write;
+use serde::Serialize;
+use std::sync::Arc;
+use tokio::sync::Mutex as AsyncMutex;
+
+
+#[derive(Serialize, Clone)]
+struct ContainerStatus {
+    name: String,
+    healthy: bool,
+    consecutive_failures: u32,
+    last_check: String, // RFC3339 timestamp
+}
+
+type SharedStatus = Arc<AsyncMutex<HashMap<String, ContainerStatus>>>;
+
+fn status_path() -> String {
+    std::env::var("XDG_RUNTIME_DIR")
+        .map(|d| format!("{d}/podman-healthcheckd-status.json"))
+        .unwrap_or_else(|_| "/run/podman-healthcheckd-status.json".to_string())
+}
+
+async fn write_status_file(status: &SharedStatus) {
+    // Clone the data out while holding the lock only briefly,
+    // then serialize/write off the async runtime's thread.
+    let snapshot = {
+        let map = status.lock().await;
+        map.clone()
+    };
+
+    let result = tokio::task::spawn_blocking(move || {
+        let json = serde_json::to_string_pretty(&snapshot)?;
+        std::fs::write(status_path(), json)?;
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!("failed to write status file: {e}"),
+        Err(e) => warn!("status file write task panicked: {e}"),
+    }
+}
 
 fn lock_path() -> String {
     std::env::var("XDG_RUNTIME_DIR")
@@ -26,6 +68,7 @@ fn acquire_single_instance_lock() -> std::io::Result<std::fs::File> {
     let file = OpenOptions::new()
         .create(true)
         .write(true)
+        .truncate(true)
         .open(lock_path())?;
 
     let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
@@ -189,6 +232,7 @@ async fn healthcheck_loop(
     name: String,
     config: HealthcheckConfig,
     token: CancellationToken,
+    status: SharedStatus,
 ) {
     let start_period = Duration::from_nanos(config.start_period); // 0 means no wait (docker/podman default)
     let interval = ns_to_duration(config.interval);
@@ -233,6 +277,25 @@ async fn healthcheck_loop(
 		        	    warn!("[{name}] healthcheck failed ({consecutive_failures}/{})", config.retries);
     			    }
                 }
+                let healthy = consecutive_failures < config.retries.max(1);
+                let changed = {
+                    let mut map = status.lock().await;
+                    let changed = match map.get(&id) {
+                        Some(prev) => prev.healthy != healthy
+                            || prev.consecutive_failures != consecutive_failures,
+                        None => true, // first time we see this container
+                    };
+                    map.insert(id.clone(), ContainerStatus {
+                        name: name.clone(),
+                        healthy,
+                        consecutive_failures,
+                        last_check: chrono::Utc::now().to_rfc3339(),
+                    });
+                    changed
+                };
+                if changed {
+                    write_status_file(&status).await;
+                }
             }
             _ = token.cancelled() => return,
         }
@@ -248,13 +311,15 @@ async fn healthcheck_loop(
 struct TaskManager {
     tasks: HashMap<String, (String, JoinHandle<()>)>,
     token: CancellationToken,
+    status: SharedStatus,
 }
 
 impl TaskManager {
-    fn new(token: CancellationToken) -> Self {
+    fn new(token: CancellationToken, status: SharedStatus) -> Self {
         Self {
             tasks: HashMap::new(),
             token,
+            status,
         }
     }
 
@@ -274,7 +339,7 @@ impl TaskManager {
         let cid = id.clone();
         let cname = name.clone();
         let ct = self.token.clone();
-        let handle = tokio::spawn(healthcheck_loop(cid, cname, config, ct));
+        let handle = tokio::spawn(healthcheck_loop(cid, cname, config, ct, self.status.clone()));
         self.tasks.insert(id, (name, handle));
     }
 
@@ -282,6 +347,15 @@ impl TaskManager {
         if let Some((name, handle)) = self.tasks.remove(id) {
             info!("[{name}] removing healthcheck timer");
             handle.abort();
+            let status = self.status.clone();
+            let id = id.to_string();
+            tokio::spawn(async move {
+                {
+                    let mut map = status.lock().await;
+                    map.remove(&id);
+                }
+                write_status_file(&status).await;
+            });
         }
     }
 
@@ -291,7 +365,13 @@ impl TaskManager {
             handle.abort();
         }
     }
-
+    async fn clear_status(&self) {
+        {
+            let mut map = self.status.lock().await;
+            map.clear();
+        }
+        write_status_file(&self.status).await;
+    }
     fn count(&self) -> usize {
         self.tasks.len()
     }
@@ -454,7 +534,9 @@ async fn main() {
     info!("podman-healthcheckd starting");
 
     let token = CancellationToken::new();
-    let mut manager = TaskManager::new(token.clone());
+    let status: SharedStatus = Arc::new(AsyncMutex::new(HashMap::new()));
+    let mut manager = TaskManager::new(token.clone(), status);
+    
 
     // Start event watcher first so events are buffered during enumeration
     let (tx, mut rx) = mpsc::channel::<Action>(1024);//or unbounded_channel
@@ -491,6 +573,7 @@ async fn main() {
 
     token.cancel();
     manager.stop_all();
+    manager.clear_status().await;
     let _ = watcher.await;
     info!("podman-healthcheckd stopped");
 }
